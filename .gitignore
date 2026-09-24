@@ -1,3 +1,13 @@
+# Only version-control the analyses_Allen/ directory; ignore everything
+# else in the repo root.
+/*
+!/analyses_Allen/
+!/.gitignore
+
+# Within analyses_Allen/, still exclude binary/office files (raw and copied
+# data, reports, etc.) — only code and documentation should be tracked.
 *.xlsx
 *.docx
 *.pdf
+*.doc
+*.ini

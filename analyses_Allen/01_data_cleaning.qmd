@@ -1,0 +1,361 @@
+---
+title: "Charbon (Onion Smut) — Data Cleaning"
+format:
+  html:
+    toc: true
+    embed-resources: true
+---
+
+## Notes
+
+Two data sets are cleaned in this file:
+
+- `donnees_parcelles_2023-25.xlsx` — data collected in the experimental
+  parcelles; this is the **training** set used for resampling/tuning.
+- `donnees_composites_2023-25.xlsx` — data collected in other (independent)
+  fields; this is the **held-out test** set, used only once at the very end
+  of the modeling process (see `02_modeling_template.qmd`).
+
+Both must end up with the same predictor columns, names, and types, and the
+same outcome-threshold definition, so keep the two cleaning tracks below in
+sync. Any step applied to one (renaming, type conversion, threshold cutoffs)
+must be mirrored in the other.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+library(tidyverse)
+library(readxl)
+library(janitor)
+```
+
+## Import — training set (parcelles)
+
+```{r}
+#| label: sheets
+train_path <- "donnees_parcelles_2023-25.xlsx"
+excel_sheets(train_path)
+```
+
+```{r}
+#| label: import
+# TODO: confirm sheet name once excel_sheets() output is known
+raw <- read_excel(train_path, sheet = 1)
+```
+
+```{r}
+#| label: clean-names
+df <- raw |> clean_names()
+glimpse(df)
+```
+
+## Import — test set (composites)
+
+```{r}
+#| label: sheets-test
+test_path <- "donnees_composites_2023-25.xlsx"
+excel_sheets(test_path)
+```
+
+```{r}
+#| label: import-test
+# TODO: confirm sheet name once excel_sheets() output is known
+raw_test <- read_excel(test_path, sheet = 1)
+```
+
+```{r}
+#| label: clean-names-test
+df_test <- raw_test |> clean_names()
+glimpse(df_test)
+```
+
+Compare column names between the two sets before proceeding, since they were
+collected independently and may not line up exactly:
+
+```{r}
+#| label: compare-columns
+setdiff(names(df), names(df_test))
+setdiff(names(df_test), names(df))
+```
+
+## Initial inspection
+
+Run these on `df` (training) and repeat on `df_test` (composites) as needed.
+
+```{r}
+#| label: distinct-counts
+df |> summarise(across(everything(), n_distinct))
+```
+
+```{r}
+#| label: missing-counts
+df |> summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+```{r}
+#| label: distinct-counts-test
+df_test |> summarise(across(everything(), n_distinct))
+```
+
+```{r}
+#| label: missing-counts-test
+df_test |> summarise(across(everything(), ~ sum(is.na(.))))
+```
+
+```{r}
+#| label: categorical-checks
+df |> count(annee)
+df |> count(cultivar)
+df |> count(traitement_de_semences)
+df |> count(type)
+df |> count(station)
+```
+
+```{r}
+#| label: categorical-checks-test
+df_test |> count(annee)
+df_test |> count(variete)
+df_test |> count(traitement_de_semence)
+df_test |> count(stade)
+```
+
+```{r}
+#| label: numeric-checks
+df |>
+  mutate(bin = cut(percent_incidence_moyenne_maximale,
+                    breaks = seq(0, 40, by = 2), include.lowest = TRUE)) |>
+  count(bin) |>
+  arrange(bin)
+```
+
+```{r}
+#| label: numeric-checks-test
+df_test |>
+  mutate(bin = cut(incidence_moy,
+                    breaks = seq(0, 40, by = 2), include.lowest = TRUE)) |>
+  count(bin) |>
+  arrange(bin)
+```
+
+## Visualize the raw data
+
+```{r}
+#| label: viz-incidence-hist
+df |>
+  ggplot(aes(percent_incidence_moyenne_maximale)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of maximum incidence (training / parcelles)",
+       x = "Percent incidence (moyenne maximale)", y = "Count")
+```
+
+```{r}
+#| label: viz-incidence-hist-test
+df_test |>
+  ggplot(aes(incidence_moy)) +
+  geom_histogram(binwidth = 1) +
+  labs(title = "Distribution of mean incidence (test / composites)",
+       x = "Percent incidence (moy)", y = "Count")
+```
+
+```{r}
+#| label: viz-incidence-by-year
+df |>
+  ggplot(aes(y = percent_incidence_moyenne_maximale, x = factor(annee))) +
+  geom_boxplot() +
+  labs(title = "Incidence by year (training)", x = "Year", y = "Percent incidence")
+```
+
+```{r}
+#| label: viz-incidence-by-cultivar
+df |>
+  ggplot(aes(y = percent_incidence_moyenne_maximale, x = cultivar)) +
+  geom_boxplot() +
+  labs(title = "Incidence by cultivar (training)", x = NULL, y = "Percent incidence") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: viz-incidence-by-treatment
+df |>
+  ggplot(aes(y = percent_incidence_moyenne_maximale, x = traitement_de_semences)) +
+  geom_boxplot() +
+  labs(title = "Incidence by seed treatment (training)", x = NULL, y = "Percent incidence") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: viz-incidence-vs-spores
+df |>
+  ggplot(aes(x = spores_g_sol, y = percent_incidence_moyenne_maximale)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Incidence vs. soil spore load (training)",
+       x = "Spores / g soil", y = "Percent incidence")
+```
+
+```{r}
+#| label: viz-incidence-vs-temp
+df |>
+  ggplot(aes(x = semi_se_temp_air, y = percent_incidence_moyenne_maximale)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Incidence vs. air temperature (sowing to flag-leaf stage)",
+       x = "Mean air temp, sowing→stade étendard", y = "Percent incidence")
+```
+
+```{r}
+#| label: viz-incidence-vs-rain
+df |>
+  ggplot(aes(x = semi_se_pluie, y = percent_incidence_moyenne_maximale)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Incidence vs. rainfall (sowing to flag-leaf stage)",
+       x = "Total rainfall, sowing→stade étendard", y = "Percent incidence")
+```
+
+```{r}
+#| label: viz-incidence-by-producteur
+df |>
+  ggplot(aes(y = percent_incidence_moyenne_maximale, x = producteur)) +
+  geom_boxplot() +
+  labs(title = "Incidence by producer (training)", x = NULL, y = "Percent incidence") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Missing data investigation
+
+```{r}
+#| label: missingness-patterns
+# Which columns have any missingness, and how much?
+df |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing))
+```
+
+```{r}
+#| label: missingness-by-year
+# Check whether missingness in key columns is concentrated in specific years
+# or producers (common when a variable was added/dropped partway through the
+# study).
+df |>
+  group_by(annee) |>
+  summarise(across(where(~ any(is.na(.))), ~ sum(is.na(.))))
+```
+
+```{r}
+#| label: missingness-sample-rows
+df |> filter(if_any(everything(), is.na)) |> slice_sample(n = min(10, nrow(df)))
+```
+
+## Type conversions / renaming
+
+Apply identical conversions/renames to both `df` and `df_test`.
+
+```{r}
+#| label: type-conversions
+# TODO: convert dates, coerce categorical columns to factors, rename columns
+# for clarity as needed.
+```
+
+```{r}
+#| label: type-conversions-test
+# TODO: mirror the conversions above for df_test.
+```
+
+## Define the outcome variables
+
+Rather than one multi-class outcome, we build **five separate binary
+outcomes**, one per threshold (1%, 2%, 3%, 4%, 5%). Each is analyzed as its
+own classification problem in its own copy of `02_modeling_template.qmd`
+(e.g. `02_modeling_threshold_1.qmd`, ... `02_modeling_threshold_5.qmd`), so a
+row can be, e.g., a positive case for `outcome_1` (incidence ≥ 1%) while also
+being negative for `outcome_5` (incidence < 5%) — these are not mutually
+exclusive levels of one factor.
+
+The training data has a continuous maximum-incidence column
+(`percent_incidence_moyenne_maximale`) and also happens to contain
+pre-computed indicator columns (`seuil_1_percent_incidence` ...
+`seuil_5_percent`). We calculate the five binary outcomes directly from the
+continuous column ourselves, rather than relying on the pre-computed
+indicators, so the derivation is transparent and uses the identical logic as
+the composites set below. (Worth spot-checking the derived columns against
+the existing `seuil_*` columns as a sanity check — see below.)
+
+```{r}
+#| label: outcome-thresholds-train
+# TODO: confirm >= is the intended boundary (vs strictly >).
+df <- df |>
+  mutate(
+    outcome_1 = factor(if_else(percent_incidence_moyenne_maximale >= 1, "above", "below"), levels = c("below", "above")),
+    outcome_2 = factor(if_else(percent_incidence_moyenne_maximale >= 2, "above", "below"), levels = c("below", "above")),
+    outcome_3 = factor(if_else(percent_incidence_moyenne_maximale >= 3, "above", "below"), levels = c("below", "above")),
+    outcome_4 = factor(if_else(percent_incidence_moyenne_maximale >= 4, "above", "below"), levels = c("below", "above")),
+    outcome_5 = factor(if_else(percent_incidence_moyenne_maximale >= 5, "above", "below"), levels = c("below", "above"))
+  )
+```
+
+```{r}
+#| label: outcome-thresholds-sanity-check
+# Sanity check: compare our derived outcomes against the pre-existing
+# seuil_* indicator columns — mismatches would suggest a different boundary
+# convention (>= vs >) or a discrepancy in how "maximale" incidence was
+# computed upstream.
+df |>
+  summarise(
+    mismatch_1 = sum((outcome_1 == "above") != (seuil_1_percent_incidence == 1)),
+    mismatch_2 = sum((outcome_2 == "above") != (seuil_2_percent_incidence == 1)),
+    mismatch_3 = sum((outcome_3 == "above") != (seuil_3_percent == 1)),
+    mismatch_4 = sum((outcome_4 == "above") != (seuil_4_percent == 1)),
+    mismatch_5 = sum((outcome_5 == "above") != (seuil_5_percent == 1))
+  )
+```
+
+```{r}
+#| label: outcome-thresholds-test
+# Composites set only has a continuous incidence column; derive the same
+# five binary indicators directly from it.
+# TODO: confirm `incidence_moy` is on the same 0-100 percent scale as the
+# training incidence column, and whether >= or > is the intended boundary.
+df_test <- df_test |>
+  mutate(
+    outcome_1 = factor(if_else(incidence_moy >= 1, "above", "below"), levels = c("below", "above")),
+    outcome_2 = factor(if_else(incidence_moy >= 2, "above", "below"), levels = c("below", "above")),
+    outcome_3 = factor(if_else(incidence_moy >= 3, "above", "below"), levels = c("below", "above")),
+    outcome_4 = factor(if_else(incidence_moy >= 4, "above", "below"), levels = c("below", "above")),
+    outcome_5 = factor(if_else(incidence_moy >= 5, "above", "below"), levels = c("below", "above"))
+  )
+```
+
+```{r}
+#| label: outcome-balance
+df |> summarise(across(starts_with("outcome_"), ~ mean(.x == "above")))
+df_test |> summarise(across(starts_with("outcome_"), ~ mean(.x == "above")))
+```
+
+Class balance in the training data (595 rows): threshold 1% ≈ 38% positive,
+2% ≈ 28%, 3% ≈ 15%, 4% ≈ 6%, 5% ≈ 4%. Imbalance increases sharply at the
+higher thresholds — the 4% and 5% analyses have few positive cases (38 and
+21 out of 595), which will make 10-fold CV noisy for those two models
+specifically (some folds may end up with very few or zero positive cases).
+Consider fewer folds (e.g. `v = 5`) or repeated CV for those two thresholds,
+and check the composites set's class balance too, since it is much smaller
+(64 rows) and may not contain any positive cases at the higher thresholds.
+
+## Save cleaned data
+
+Both `df` and `df_test` now carry all five `outcome_1` ... `outcome_5`
+columns, both derived directly from each set's continuous incidence column
+(`percent_incidence_moyenne_maximale` / `incidence_moy`) rather than from
+pre-computed indicators. Each modeling template picks one outcome at a time
+via a single `outcome_col` setting, and should drop both the raw incidence
+column and the (now redundant) `seuil_*` indicator columns as potential
+leakage.
+
+```{r}
+#| label: save
+# TODO: confirm final column set before saving; keep column names/types
+# identical between the two files.
+write_rds(df, "donnees_parcelles_clean.rds")
+write_rds(df_test, "donnees_composites_clean.rds")
+```

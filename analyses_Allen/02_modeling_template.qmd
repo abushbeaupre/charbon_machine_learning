@@ -1,0 +1,477 @@
+---
+title: "Charbon (Onion Smut) — Modeling Template"
+format:
+  html:
+    toc: true
+    embed-resources: true
+---
+
+# Notes
+
+This template covers ONE model type × ONE threshold at a time (e.g. decision
+tree for the 1% threshold). Since we're running five separate binary
+analyses (1%, 2%, 3%, 4%, 5% thresholds) × three model types, duplicate this
+file per combination (e.g. `02_tree_threshold1.qmd`, `02_rf_threshold1.qmd`,
+..., `02_boost_threshold5.qmd`), keeping the recipe/resampling structure
+identical across copies so results are comparable across thresholds and
+models. Alternatively, once the pipeline is working for one threshold,
+consider combining the three model specs with `workflowsets::workflow_set()`
++ `workflow_map()` for a given threshold, or wrapping the whole file in a
+function/loop over `outcome_col` if you'd rather iterate programmatically
+than duplicate files.
+
+**Select which threshold this copy analyzes** by setting `outcome_col`
+below — this is the only thing that needs to change between the five
+threshold copies of this file (assuming predictors are otherwise identical).
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+# `tidymodels` is a meta-package: loading it attaches the packages we need
+# for the whole pipeline — `recipes` (preprocessing), `parsnip` (unified
+# model specification syntax), `rsample` (splitting/resampling), `tune` +
+# `dials` (hyperparameter tuning), `workflows` (bundling recipe + model), and
+# `yardstick` (performance metrics).
+library(tidymodels)
+library(themis)   # subsampling steps for class imbalance (step_downsample, step_upsample, step_smote)
+library(vip)       # variable importance plots for the final fitted model
+# library(bonsai)  # only needed if using lightgbm engine for boosted trees
+
+# Several tidyverse packages (e.g. dplyr, purrr) export functions with the
+# same name as tidymodels functions (e.g. `slice()`). tidymodels_prefer()
+# resolves these conflicts by making the tidymodels version the default
+# whenever both are loaded.
+tidymodels_prefer()
+```
+
+## Load cleaned data
+
+Training data (`parcelles`) and the independent test data (`composites`) were
+cleaned in `01_data_cleaning.qmd` and saved separately, each carrying five
+binary outcome columns (`outcome_1` ... `outcome_5`, one per threshold). The
+composites data is a genuinely independent field test set — collected in
+different fields than the training/tuning data — so it is **not** produced
+via `initial_split()`; it is loaded as-is and touched only once, at the very
+end.
+
+```{r}
+#| label: load-data
+# read_rds() restores the exact R objects (types, factor levels, etc.) saved
+# by 01_data_cleaning.qmd — safer than re-reading the Excel files here, since
+# we want the cleaning decisions made in that file to be the single source of
+# truth for both the training and test data.
+train_full <- read_rds("donnees_parcelles_clean.rds")
+test_full  <- read_rds("donnees_composites_clean.rds")
+
+# Each cleaned data set carries five candidate outcome columns
+# (outcome_1 ... outcome_5), one binary factor per incidence threshold.
+# This template analyzes ONE threshold at a time, so we pick a single
+# column here and rename it to the generic name `outcome` — that way the
+# rest of the pipeline below (recipe, model formula, metrics) doesn't need
+# to change between the five copies of this file; only this line does.
+# TODO: set which threshold this copy of the template analyzes.
+outcome_col <- "outcome_1"
+
+# Besides the four *other* outcome_* columns (which must be dropped so they
+# aren't accidentally used as predictors for this threshold), we also drop
+# any column that was used to derive the outcomes in the first place. If we
+# kept, say, percent_incidence_moyenne_maximale as a predictor, the model
+# could learn the trivial rule "incidence >= 1 -> above" instead of learning
+# from the actual agronomic/weather predictors — this is called "leakage"
+# and would make the model's test performance look artificially perfect.
+# TODO: replace with the actual predictor set once finalized.
+leakage_cols <- c("seuil_1_percent_incidence", "seuil_2_percent_incidence",
+                   "seuil_3_percent", "seuil_4_percent", "seuil_5_percent",
+                   "percent_incidence_moyenne_maximale", "incidence_moy")
+
+# rename(outcome = all_of(outcome_col)) renames whichever column outcome_col
+# points to (e.g. "outcome_1") to the literal name `outcome`.
+# select(-starts_with("outcome_"), -any_of(leakage_cols), outcome) drops the
+# remaining outcome_* columns and the leakage columns, then re-adds `outcome`
+# at the end (select() drops it too, since it also starts with "outcome_",
+# so we have to explicitly list it again to keep it).
+train <- train_full |>
+  rename(outcome = all_of(outcome_col)) |>
+  select(-starts_with("outcome_"), -any_of(leakage_cols), outcome)
+
+test <- test_full |>
+  rename(outcome = all_of(outcome_col)) |>
+  select(-starts_with("outcome_"), -any_of(leakage_cols), outcome)
+```
+
+## Resampling for tuning
+
+All hyperparameter tuning and model comparison happens via cross-validation
+on `train` only. `test` (composites) is never used until `last_fit()` below.
+
+For the higher thresholds (4%, 5%) the positive class is rare (~6% and ~4%
+of training rows respectively) — consider fewer folds (e.g. `v = 5`) or
+`vfold_cv(..., repeats = ...)` for those two threshold copies, since 10 folds
+may leave some folds with very few positive cases.
+
+```{r}
+#| label: resamples
+# set.seed() makes the random fold assignment reproducible — anyone re-running
+# this chunk gets the exact same folds. Any seed works; what matters is
+# fixing *some* seed before any random process (splitting, subsampling,
+# hyperparameter grid sampling, etc.).
+set.seed(6182)
+
+# vfold_cv() implements v-fold (a.k.a. k-fold) cross-validation: it splits
+# `train` into v roughly equal folds. For each of the v tuning iterations,
+# v-1 folds are used to fit the model ("analysis" set) and the remaining
+# fold is used to evaluate it ("assessment" set) — this repeats v times so
+# every row gets used for assessment exactly once. Averaging performance
+# across the v folds gives a more stable estimate of how well a given set of
+# hyperparameters generalizes than a single train/validation split would.
+# `strata = outcome` ensures each fold has approximately the same proportion
+# of "above"/"below" cases as the full training set — important here because
+# the outcome is imbalanced, especially at higher thresholds.
+folds <- vfold_cv(train, v = 10, strata = outcome)  # TODO: reduce v for rarer thresholds
+```
+
+## Recipe
+
+```{r}
+#| label: recipe
+# A `recipe` is tidymodels' preprocessing specification: a sequence of steps
+# applied to the data before it reaches the model. Critically, when a recipe
+# is used inside a workflow with resampling (as we do below), each step is
+# re-estimated on only the analysis (training) fold and then applied to the
+# assessment fold — this avoids leaking information from validation data
+# into preprocessing decisions (e.g. computing a mean to normalize by should
+# only ever use training rows).
+#
+# recipe(outcome ~ ., data = train) declares the model formula: predict
+# `outcome` from every other column in `train` ("."). The `data` argument is
+# only used to record column names/types, not to fit anything yet.
+rec <- recipe(outcome ~ ., data = train) |>
+  # step_novel() reserves a "new" factor level for any category that shows
+  # up in future data (e.g. the composites test set, or new fields) but
+  # never appeared in the training data — without this, applying the recipe
+  # to unseen categories would error out.
+  step_novel(all_nominal_predictors()) |>
+  # step_dummy() converts categorical (factor/character) predictors into
+  # 0/1 dummy columns (one-hot encoding minus a reference level), since most
+  # engines here (rpart, ranger, xgboost) either require numeric input
+  # (xgboost) or benefit from consistent encoding across engines.
+  step_dummy(all_nominal_predictors()) |>
+  # step_zv() drops "zero-variance" columns — predictors that take only one
+  # value in the training data (e.g. a dummy column that ended up constant
+  # after filtering) and so carry no information.
+  step_zv(all_predictors()) |>
+  # step_normalize() centers and scales numeric predictors to mean 0 / sd 1.
+  # Tree-based models (all three we use here) are invariant to monotonic
+  # rescaling of predictors, so this step doesn't change tree-based model
+  # performance — it's included mostly as a placeholder/reminder in case a
+  # non-tree model is added later; feel free to remove it for a pure
+  # tree/forest/boosting comparison.
+  step_normalize(all_numeric_predictors()) |>  # optional; trees don't require this
+  # TODO: adjust predictors, encoding steps, and imbalance handling as needed.
+  # Only keep ONE of the step_*sample() lines below — these correct for
+  # class imbalance by resampling the *training* data seen during model
+  # fitting (never the assessment/test data, which must reflect real-world
+  # class proportions for honest evaluation):
+  #   step_downsample(outcome) — randomly removes majority-class ("below")
+  #     rows until both classes are equally represented. Simple, but throws
+  #     away data — costly here given the small sample size (595 rows),
+  #     especially at the rarer 4%/5% thresholds.
+  #   step_upsample(outcome)  — randomly duplicates minority-class ("above")
+  #     rows until both classes are equal. Keeps all original data but can
+  #     make the model overfit to the duplicated minority rows.
+  #   step_smote(outcome)     — synthesizes new minority-class rows by
+  #     interpolating between existing minority-class neighbors (SMOTE),
+  #     rather than duplicating them exactly. Needs enough minority
+  #     neighbors to work well, which is a concern for the rarest thresholds.
+  # For the 4%/5% thresholds (rare positive class), downsampling discards a
+  # lot of majority-class data given the small sample size — upsampling or
+  # SMOTE may be preferable there; compare against downsampling empirically
+  # rather than assuming.
+  # step_downsample(outcome)
+  # step_upsample(outcome)
+  # step_smote(outcome)
+  identity()  # placeholder so the pipe chain above is syntactically valid with steps commented out
+```
+
+## Model specification
+
+Keep only the block relevant to this copy of the template. Each `parsnip`
+model spec below declares which hyperparameters to tune (via `tune()`,
+a placeholder telling tidymodels "search over values for this argument
+rather than using a fixed value") and which underlying R engine/package
+implements the model.
+
+```{r}
+#| label: model-spec-tree
+# A single decision tree recursively splits the data on predictor values to
+# separate the two outcome classes as purely as possible at each split.
+# Simple and interpretable, but a single tree tends to overfit training data
+# unless its growth is controlled by the hyperparameters below:
+#   cost_complexity — penalty added per additional split/leaf ("cp" in
+#     rpart); larger values prune the tree more aggressively (simpler tree).
+#   tree_depth      — maximum number of splits from root to any leaf.
+#   min_n           — minimum number of observations required in a node
+#     before it can be split further.
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth      = tune(),
+  min_n           = tune()
+) |>
+  set_engine("rpart") |>
+  set_mode("classification")
+```
+
+```{r}
+#| label: model-spec-rf
+# Random forest fits many decision trees (the `trees` argument) on
+# bootstrap-resampled versions of the training data, each considering only a
+# random subset of predictors (`mtry`) at every split. Averaging (technically,
+# majority-voting for classification) across many decorrelated trees reduces
+# the overfitting a single tree is prone to.
+#   mtry  — number of predictors randomly sampled as candidates at each
+#     split (smaller values decorrelate trees more, at the cost of each
+#     individual tree being weaker).
+#   trees — number of trees in the forest.
+#   min_n — minimum observations required in a node before splitting
+#     (controls how deep/complex individual trees can grow).
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  trees = tune(),
+  min_n = tune()
+) |>
+  # importance = "impurity" tells ranger to record, for each predictor, how
+  # much it reduces node impurity across all trees on average — this is
+  # what powers the vip() variable-importance plot at the end of this file.
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("classification")
+```
+
+```{r}
+#| label: model-spec-boost
+# Boosted trees (here, xgboost) build trees sequentially rather than
+# independently: each new tree is fit to correct the errors of the trees
+# fit so far, weighted by a learning rate. This often achieves the best raw
+# predictive performance of the three methods, at the cost of more
+# hyperparameters to tune and less interpretability than a single tree.
+#   mtry           — predictors randomly sampled as candidates per split.
+#   trees          — number of sequential boosting rounds (trees added).
+#   min_n          — minimum observations required in a node to split.
+#   tree_depth     — maximum depth of each individual tree (kept shallow in
+#     boosting, since trees are meant to be "weak learners" corrected
+#     iteratively, not strong learners on their own).
+#   learn_rate     — how much each new tree's predictions are down-weighted
+#     before being added to the ensemble; smaller values need more trees but
+#     generalize better (less prone to overfitting).
+#   loss_reduction — minimum improvement in the loss function required to
+#     make an additional split (a regularization term, "gamma" in xgboost).
+#   sample_size    — proportion of training rows randomly subsampled to
+#     grow each tree (stochastic gradient boosting; adds regularization
+#     similar to bagging in random forests).
+boost_spec <- boost_tree(
+  mtry          = tune(),
+  trees         = tune(),
+  min_n         = tune(),
+  tree_depth    = tune(),
+  learn_rate    = tune(),
+  loss_reduction = tune(),
+  sample_size   = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+```
+
+```{r}
+#| label: select-spec
+# TODO: pick the spec matching this template copy (tree_spec, rf_spec, or
+# boost_spec). Everything downstream (workflow, tuning, evaluation) refers
+# only to `model_spec`, so this is the only line that needs to change
+# between the tree/RF/boosted copies of this file.
+model_spec <- tree_spec  # or rf_spec / boost_spec
+```
+
+## Workflow
+
+```{r}
+#| label: workflow
+# A `workflow` bundles the preprocessing recipe and the model specification
+# into one object, so that both are fit/applied together — this ensures the
+# exact same preprocessing (fit on the analysis fold) is used whenever the
+# model is fit or predictions are made, and lets `tune_grid()`/`last_fit()`
+# below operate on a single object instead of juggling recipe and model
+# separately.
+wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(model_spec)
+```
+
+## Tuning grid
+
+```{r}
+#| label: tuning-grid
+# TODO: mtry's valid range depends on the number of predictors available
+# after the recipe runs (it can't sample more predictors than exist), which
+# tidymodels doesn't know automatically — finalize() fills in that range by
+# inspecting `train`. Needed whenever mtry (rf_spec, boost_spec) is tuned;
+# not needed for tree_spec, which has no mtry parameter.
+# params <- extract_parameter_set_dials(wf) |>
+#   finalize(train)
+
+# grid_latin_hypercube() generates a space-filling random sample of
+# hyperparameter combinations (a Latin hypercube design spreads points
+# evenly across the multi-dimensional parameter space, unlike simple random
+# sampling which can cluster points). This is generally more efficient than
+# a full grid search (grid_regular()) when tuning several hyperparameters
+# at once, since a regular grid's size grows multiplicatively with each
+# added parameter.
+# extract_parameter_set_dials(wf) reads off the tunable parameters and their
+# default ranges directly from `wf` (the tree_spec/rf_spec/boost_spec chosen
+# above), so this line doesn't need to change between model copies of this
+# template — it automatically adapts to whichever spec is active.
+grid <- grid_latin_hypercube(
+  extract_parameter_set_dials(wf),
+  size = 25  # TODO: adjust grid size — more candidate combinations gives a
+             # finer search but takes proportionally longer to run
+)
+```
+
+## Tune
+
+```{r}
+#| label: tune
+#| message: false
+# metric_set() bundles several yardstick metrics to compute together during
+# tuning, so we don't need separate tune_grid() calls per metric:
+#   roc_auc     — area under the ROC curve; overall ability to rank "above"
+#     cases higher than "below" cases across all possible classification
+#     thresholds (probability cutoffs), independent of class imbalance.
+#   pr_auc      — area under the precision-recall curve; often more
+#     informative than roc_auc when the positive class is rare (as at the
+#     4%/5% thresholds here), since it focuses on how well positives are
+#     identified without being diluted by the (large) number of true
+#     negatives.
+#   sensitivity — proportion of true "above" cases correctly identified
+#     (a.k.a. recall / true positive rate).
+#   specificity — proportion of true "below" cases correctly identified
+#     (true negative rate).
+#   f_meas      — harmonic mean of precision and sensitivity; a single
+#     summary number balancing both types of error.
+metrics <- metric_set(roc_auc, pr_auc, sensitivity, specificity, f_meas)
+
+set.seed(8524)
+# tune_grid() is the workhorse of the tuning process: for every row of
+# `grid` (i.e. every candidate hyperparameter combination), it fits the
+# workflow on each fold's analysis set and evaluates it on that fold's
+# assessment set, recording all requested `metrics`. With 10 folds and a
+# grid of 25 combinations, this fits 250 models in total.
+tune_res <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = grid,
+  metrics = metrics,
+  # save_pred = TRUE keeps the per-row predictions from every fold/parameter
+  # combination, which lets us inspect them later if needed (at the cost of
+  # more memory) — not strictly required, but convenient during exploration.
+  control = control_grid(save_pred = TRUE)
+)
+```
+
+```{r}
+#| label: tuning-results
+# autoplot() visualizes how each metric varies across the values tried for
+# each hyperparameter — useful for spotting whether performance is fairly
+# flat (many hyperparameter values work about as well) or sharply peaked
+# (only a narrow range of values performs well) across the search space.
+autoplot(tune_res)
+
+# show_best() lists the top hyperparameter combinations (by default, 5)
+# ranked by the chosen metric, averaged across the 10 folds — this is what
+# we inspect to decide which single combination to carry forward.
+show_best(tune_res, metric = "roc_auc")
+```
+
+## Finalize and fit
+
+```{r}
+#| label: finalize
+# select_best() picks the single best-performing hyperparameter combination
+# (by the chosen metric, averaged across folds) from the tuning results.
+best_params <- select_best(tune_res, metric = "roc_auc")  # TODO: confirm metric
+
+# finalize_workflow() substitutes those specific hyperparameter values into
+# the workflow's model spec, replacing the tune() placeholders — the result
+# is an ordinary (non-tunable) workflow ready to be fit on data.
+final_wf <- finalize_workflow(wf, best_params)
+```
+
+```{r}
+#| label: manual-split
+# last_fit() (below) expects an `rsplit` object — the same kind of object
+# initial_split() would normally produce — bundling a training portion
+# ("analysis") and a test portion ("assessment") together. We build one
+# manually from the two separately-loaded data sets rather than from
+# initial_split(), since train/test here come from different fields (not a
+# random split of one data set) and we want to preserve that real-world
+# separation rather than re-shuffling rows across the two sources.
+split <- make_splits(list(analysis = train, assessment = test))
+```
+
+```{r}
+#| label: last-fit
+# last_fit() does two things in one call: (1) fits `final_wf` (recipe +
+# finalized model) on the analysis set (all of `train`), and (2) evaluates
+# the fitted model once on the assessment set (all of `test`, the composites
+# data). This is the ONLY time the composites data touches the model
+# fitting/selection process — everything above (tuning, hyperparameter
+# selection) used only `train` via cross-validation, so this final number is
+# an honest estimate of performance on genuinely new fields.
+final_fit <- last_fit(final_wf, split, metrics = metrics)
+collect_metrics(final_fit)
+```
+
+## Evaluate on test set
+
+```{r}
+#| label: confusion-matrix
+# collect_predictions() extracts the row-level predicted class (.pred_class)
+# and predicted probabilities for each class from final_fit, for every row
+# of the composites (test) set.
+# conf_mat() cross-tabulates true outcome vs. predicted class — the
+# diagonal counts correct predictions; off-diagonal cells show which kind of
+# error (false positive vs. false negative) the model makes, and how often.
+collect_predictions(final_fit) |>
+  conf_mat(truth = outcome, estimate = .pred_class)
+```
+
+```{r}
+#| label: roc-curve
+# roc_curve() traces sensitivity vs. (1 - specificity) as the probability
+# cutoff for classifying a row as "above" is swept from 0 to 1 — this shows
+# the full tradeoff between catching true "above" cases and incorrectly
+# flagging "below" cases as the decision threshold changes, rather than
+# collapsing that tradeoff into the single default 0.5 cutoff used by
+# .pred_class above.
+collect_predictions(final_fit) |>
+  roc_curve(outcome, .pred_above) |>  # TODO: confirm positive-class column name
+  autoplot()
+```
+
+## Variable importance
+
+```{r}
+#| label: vip
+# extract_workflow() pulls the fitted workflow object out of final_fit, and
+# extract_fit_parsnip() pulls the underlying fitted model object out of that
+# workflow (e.g. the rpart/ranger/xgboost model object itself).
+# vip() then plots each predictor's importance to the model's predictions —
+# for rpart/xgboost this is a built-in importance measure from the engine;
+# for ranger it uses the impurity-based importance we requested via
+# importance = "impurity" in the model spec above. This helps identify which
+# agronomic/weather variables the model is actually relying on, which is
+# often as valuable as the predictive performance itself for this kind of
+# study.
+extract_workflow(final_fit) |>
+  extract_fit_parsnip() |>
+  vip()
+```
